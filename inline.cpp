@@ -19,7 +19,7 @@ GstElement *gltransformation0;
 GstElement *gltransformation1;
 GstElement *appsrc;
 GstElement *videocrop;
-GstElement *x265enc
+GstElement *x265enc;
 stabilizer st;
 VideoCapture cap;
 std::thread frames;
@@ -31,6 +31,8 @@ int fps = 30;
 int crop_x = width*CROP_P;
 int crop_y = height*CROP_P;
 bool stab = true;
+bool rot = true;
+// Signal handler
 void signalHandler(int signal){
 
 }
@@ -82,10 +84,23 @@ void process_frame() {
   
     std::cout << "Started reading frames\n";
     unsigned long int frame_count = 0;
+    auto t1 = std::chrono::high_resolution_clock::now();
+    auto t2 = t1;
+    auto t3 = t1;
+    auto t4 = t1;
+    // Allocate OpenCL input and output buffers
+    cl::Buffer inputBuffer(context, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, frameSize*sizeof(unsigned char));
+    cl::Buffer outputBuffer(context, CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR, frameSize*sizeof(unsigned char));
+    // Set fixed kernel arguments
+    rotateKernel.setArg(0, inputBuffer);
+    rotateKernel.setArg(1, outputBuffer);
+    rotateKernel.setArg(2, width);
+    rotateKernel.setArg(3, height);
     while(true){
         static GstClockTime timestamp = 0;    
         cap >> frame;
-	if (stab){
+        t1 = std::chrono::high_resolution_clock::now();
+        if (stab){
            float x,y,a;
            st.stabilize(frame,&x,&y,&a);
            //avoid stabilization if the correction is too small
@@ -98,29 +113,23 @@ void process_frame() {
   	     //clamp rotation angle to 2 degrees
            if (a > 0.035) a = 0.035;
            if (a < -0.035) a = -0.035;
-  
+           
            prevFrame = st.getPrevFrame();
            if (prevFrame.empty()) continue;
-           image = &prevFrame;
-           auto t1 = std::chrono::high_resolution_clock::now();
-           cvtColor(prevFrame,prevFrame,COLOR_BGR2BGRA);    	
-           cl::Buffer inputBuffer(context, CL_MEM_READ_WRITE, frameSize*sizeof(unsigned char));
-           cl::Buffer outputBuffer(context, CL_MEM_READ_WRITE, frameSize*sizeof(unsigned char));
-           // Set kernel arguments
-           rotateKernel.setArg(0, inputBuffer);
-           rotateKernel.setArg(1, outputBuffer);
-           rotateKernel.setArg(2, width);
-           rotateKernel.setArg(3, height);
-           rotateKernel.setArg(4, std::cos(a));
-           rotateKernel.setArg(5, std::sin(a));
+	   image = &prevFrame;
+           if(rot){
+               t3 = std::chrono::high_resolution_clock::now();
+               cvtColor(prevFrame,prevFrame,COLOR_BGR2BGRA);    	
+               rotateKernel.setArg(4, std::cos(a));
+               rotateKernel.setArg(5, std::sin(a));
 
-           // Run the kernel
-	   queue.enqueueWriteBuffer(inputBuffer, CL_TRUE, 0, frameSize*sizeof(unsigned char), (unsigned char*)prevFrame.datastart); 
-           queue.enqueueNDRangeKernel(rotateKernel, cl::NullRange, globalSize, cl::NullRange);
-           queue.enqueueReadBuffer(outputBuffer, CL_TRUE, 0, frameSize*sizeof(unsigned char), (unsigned char*)output.datastart);
-	   cvtColor(output,prevFrame,COLOR_BGRA2BGR);    	
-           auto t2 = std::chrono::high_resolution_clock::now();
-
+               // Run the kernel
+	       queue.enqueueWriteBuffer(inputBuffer, CL_TRUE, 0, frameSize*sizeof(unsigned char), (unsigned char*)prevFrame.datastart); 
+               queue.enqueueNDRangeKernel(rotateKernel, cl::NullRange, globalSize, cl::NullRange);
+               queue.enqueueReadBuffer(outputBuffer, CL_TRUE, 0, frameSize*sizeof(unsigned char), (unsigned char*)output.datastart);
+	       cvtColor(output,prevFrame,COLOR_BGRA2BGR);    	
+               t4 = std::chrono::high_resolution_clock::now();
+	   }
            g_object_set(videocrop, "top",    crop_y-(int)(gy*height),
                                     "bottom", crop_y+(int)(gy*height),
                                     "left",   crop_x-(int)(gx*width),
@@ -163,7 +172,10 @@ void process_frame() {
         if (ret != GST_FLOW_OK) {
             g_printerr("Error pushing buffer to appsrc\n");
         }
-	if (frame_count % 120 == 0) std::cout << "rot ms: " << std::chrone::curation_cast<std::chrone::milliseconds>(t2-t1) << "\n";
+        t2 = std::chrono::high_resolution_clock::now();
+	int delay = std::chrono::duration_cast<std::chrono::milliseconds>(t2-t1).count();
+	int rot = std::chrono::duration_cast<std::chrono::milliseconds>(t4-t3).count();
+	//if (frame_count % 120 == 0) std::cout << "loop ms: " << delay-rot  << "\n" << "rot ms: " << rot << "\n";
 	frame_count++;
     }
 }
@@ -172,7 +184,7 @@ int main(int argc, char *argv[]) {
     gst_init(&argc, &argv);
     //std::signal(SIGINT, signalHandler);
     if (argc < 5) {
-         std::cout << "Arguments are v4l2 device, multiudpsink clients and ts filename.\nWidth, height, transmission width, transmission height, framerate, bitrate in kbps and stabilization are optional, default 1280x720@30 2000 kbps.\n";
+         std::cout << "Arguments are v4l2 device, multiudpsink clients and ts filename.\nWidth, height, transmission width, transmission height, framerate, bitrate in kbps, stabilization and rotational stabilization are optional, default is 1920x1080@30 to 1280x720@30 2000 kbps.\n";
 	 return -1;
     }
     const char* device = argv[1];
@@ -180,7 +192,7 @@ int main(int argc, char *argv[]) {
     const char* fout = argv[3];
     const char* shmout = argv[4];
     int bitrate = 2000*1000;
-    if (argc == 12){
+    if (argc == 13){
         width = std::stoi(argv[5]);
       	height = std::stoi(argv[6]);
         t_width = std::stoi(argv[7]);
@@ -188,6 +200,7 @@ int main(int argc, char *argv[]) {
         fps = std::stoi(argv[9]);
         bitrate = std::stoi(argv[10])*1000;
 	stab = (bool)std::stoi(argv[11]);
+	rot = (bool)std::stoi(argv[12]);
         crop_x = width*CROP_P;
         crop_y = height*CROP_P;    
     }
@@ -205,7 +218,7 @@ int main(int argc, char *argv[]) {
     std::string cvpipeline = "v4l2src device=" + std::string(device) + " io-mode=4 ! "
                              "image/jpeg,width="+ std::to_string(width) +",height="+ std::to_string(height) +",framerate="+ std::to_string(fps) +"/1 ! "
                              "queue ! mppjpegdec format=16 ! video/x-raw,format=BGR ! tee name=t t. ! "
-                             "queue ! appsink max-buffers=2 drop=false sync=false t. ! "
+                             "queue ! appsink max-buffers=3 drop=true sync=false t. ! "
 			     "queue ! shmsink socket-path=" + std::string(shmout) + " wait-for-connection=false" ;
 
 
