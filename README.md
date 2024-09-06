@@ -7,5 +7,4 @@ Some resolutions crash the RGA scaler, like 800x600. Use multiples of 16 for the
 
 A H264 high bandwidth stream is saved to the SD card, to avoid loading the H265 encoder. Both streams are stabilized if stabilization is enabled. A raw video shm source can be used to capture the original decompressed video to save it, process it through image recognitioning, or other uses.
 
-TODO:
-Add JSON api to set parameters like transmission resolution, bandwidth and key frames in real time.
+Uses JSON-RPC to control transmission bandwidth and stabilization options.

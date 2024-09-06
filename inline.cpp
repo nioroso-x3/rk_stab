@@ -11,31 +11,92 @@
 //#include <gst/gl/gl.h>
 #include <opencv2/opencv.hpp>
 #include <gst/app/gstappsink.h>
+#include "stubserver.h"
+#include <jsonrpccpp/server/connectors/httpserver.h>
 #include "stabilization.h"
+
 #define CROP_P 0.05
 using namespace cv;
-
-GstElement *gltransformation0;
-GstElement *gltransformation1;
+using namespace jsonrpc;
+//GstElement *gltransformation0;
+//GstElement *gltransformation1;
 GstElement *appsrc;
 GstElement *videocrop;
-GstElement *x265enc;
+GstElement *x265enc0;
+GstElement *x265enc1;
+GstElement *udpsink0;
+GstElement *udpsink1;
 stabilizer st;
 VideoCapture cap;
 std::thread frames;
 int width = 1920;
 int height = 1080;
-int t_width = 1280;
-int t_height = 720;
+int width_t0 = 1280;
+int height_t0 = 720;
+int width_t1 = width_t0/2;
+int height_t1 = height_t0/2;
 int fps = 30;
 int crop_x = width*CROP_P;
 int crop_y = height*CROP_P;
-bool stab = true;
-bool rot = true;
+int bitrate0 = 2000*1000;
+int bitrate1 = bitrate0/3;
+int stab = 3;
 // Signal handler
 void signalHandler(int signal){
 
 }
+
+class JSONServer : public stubserver {
+public:
+  JSONServer(AbstractServerConnector &connector, serverVersion_t type);
+
+  virtual void setParam(const Json::Value &args);
+  virtual Json::Value getParam();
+};
+
+JSONServer::JSONServer(AbstractServerConnector &connector, serverVersion_t type) : stubserver(connector,type) {}
+void JSONServer::setParam(const Json::Value &args){
+    //print parameters
+    auto itr = args.begin();
+    int i = 0;
+    for (itr = args.begin(); itr != args.end(); itr++){
+      auto name = args.getMemberNames()[i];
+      if (args[name].size() > 1) {
+          for (auto x:args[name]) {
+              std::cout << name << ": " << x << std::endl;
+          }
+      } else {
+        std::cout << name + " ";
+        std::cout << args[name] << std::endl;
+      }
+      i++;
+    }
+    if (args.isMember("bitrate0") && args["bitrate0"].isInt()) bitrate0 = args["bitrate0"].asInt()*1000;
+    if (args.isMember("bitrate1") && args["bitrate1"].isInt()) bitrate1 = args["bitrate1"].asInt()*1000;
+    if (args.isMember("stab") && args["stab"].isInt()) stab = args["stab"].asInt();
+    if (args.isMember("clients0") && args["clients0"].isString()){
+    }
+    if (args.isMember("clients1") && args["clients1"].isString()){
+    }
+    
+    g_object_set(x265enc0, "bps", bitrate0,
+                           NULL);
+
+    g_object_set(x265enc1, "bps", bitrate1,
+                            NULL);
+
+}
+
+Json::Value JSONServer::getParam(){
+  Json::Value result;
+  result["bitrate0"] = bitrate0/1000;
+  result["bitrate1"] = bitrate1/1000;
+  result["stab"] = stab;
+  result["clients0"] = "null";
+  result["clients1"] = "null";
+  return result;
+}
+
 
 // OpenCL kernel for rotating an image
 const char *rotateKernelSource = R"(
@@ -51,7 +112,7 @@ __kernel void rotate_image(__global uchar4* input, __global uchar4* output, int 
     if(nx >= 0 && nx < width && ny >= 0 && ny < height) {
         output[y * width + x] = input[ny * width + nx];
     } else {
-        output[y * width + x] = (uchar4)(0, 0, 0, 0); // Transparent background
+        output[y * width + x] = (uchar4)(0, 0, 0, 0); 
     }
 }
 )";
@@ -90,7 +151,7 @@ void process_frame() {
     auto t4 = t1;
     // Allocate OpenCL input and output buffers
     cl::Buffer inputBuffer(context, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, frameSize*sizeof(unsigned char));
-    cl::Buffer outputBuffer(context, CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR, frameSize*sizeof(unsigned char));
+    cl::Buffer outputBuffer(context, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, frameSize*sizeof(unsigned char));
     // Set fixed kernel arguments
     rotateKernel.setArg(0, inputBuffer);
     rotateKernel.setArg(1, outputBuffer);
@@ -100,7 +161,7 @@ void process_frame() {
         static GstClockTime timestamp = 0;    
         cap >> frame;
         t1 = std::chrono::high_resolution_clock::now();
-        if (stab){
+        if (stab > 0){
            float x,y,a;
            st.stabilize(frame,&x,&y,&a);
            //avoid stabilization if the correction is too small
@@ -110,42 +171,42 @@ void process_frame() {
            if (a < 0.001f && a > -0.001f) a = 0.0f;
            gfloat gx = x;
            gfloat gy = y;
-  	     //clamp rotation angle to 2 degrees
+           //clamp rotation angle to 2 degrees
            if (a > 0.035) a = 0.035;
            if (a < -0.035) a = -0.035;
            
            prevFrame = st.getPrevFrame();
            if (prevFrame.empty()) continue;
-	   image = &prevFrame;
-           if(rot){
+           image = &prevFrame;
+           if(stab > 2){
                t3 = std::chrono::high_resolution_clock::now();
-               cvtColor(prevFrame,prevFrame,COLOR_BGR2BGRA);    	
+               cvtColor(prevFrame,prevFrame,COLOR_BGR2BGRA);        
                rotateKernel.setArg(4, std::cos(a));
                rotateKernel.setArg(5, std::sin(a));
 
                // Run the kernel
-	       queue.enqueueWriteBuffer(inputBuffer, CL_TRUE, 0, frameSize*sizeof(unsigned char), (unsigned char*)prevFrame.datastart); 
+               queue.enqueueWriteBuffer(inputBuffer, CL_TRUE, 0, frameSize*sizeof(unsigned char), (unsigned char*)prevFrame.datastart); 
                queue.enqueueNDRangeKernel(rotateKernel, cl::NullRange, globalSize, cl::NullRange);
                queue.enqueueReadBuffer(outputBuffer, CL_TRUE, 0, frameSize*sizeof(unsigned char), (unsigned char*)output.datastart);
-	       cvtColor(output,prevFrame,COLOR_BGRA2BGR);    	
+               cvtColor(output,prevFrame,COLOR_BGRA2BGR);        
                t4 = std::chrono::high_resolution_clock::now();
-	   }
+           }
            g_object_set(videocrop, "top",    crop_y-(int)(gy*height),
                                     "bottom", crop_y+(int)(gy*height),
                                     "left",   crop_x-(int)(gx*width),
                                     "right",  crop_x+(int)(gx*width),
                                     NULL);
-      	
-	}
-	else{
-	    image = &frame;
+          
+          }
+          else{
+              image = &frame;
             g_object_set(videocrop, "top",    0,
                                     "bottom", 0,
                                     "left",   0,
                                     "right",  0,
                                      NULL);
 
-	}
+          } 
         // Create a new buffer
         GstBuffer *buffer;
         guint size;
@@ -173,34 +234,36 @@ void process_frame() {
             g_printerr("Error pushing buffer to appsrc\n");
         }
         t2 = std::chrono::high_resolution_clock::now();
-	int delay = std::chrono::duration_cast<std::chrono::milliseconds>(t2-t1).count();
-	int rot = std::chrono::duration_cast<std::chrono::milliseconds>(t4-t3).count();
-	//if (frame_count % 120 == 0) std::cout << "loop ms: " << delay-rot  << "\n" << "rot ms: " << rot << "\n";
-	frame_count++;
+        int delay = std::chrono::duration_cast<std::chrono::milliseconds>(t2-t1).count();
+        int rot = std::chrono::duration_cast<std::chrono::milliseconds>(t4-t3).count();
+        //if (frame_count % 120 == 0) std::cout << "loop ms: " << delay-rot  << "\n" << "rot ms: " << rot << "\n";
+        frame_count++;
     }
 }
 
 int main(int argc, char *argv[]) {
     gst_init(&argc, &argv);
     //std::signal(SIGINT, signalHandler);
-    if (argc < 5) {
-         std::cout << "Arguments are v4l2 device, multiudpsink clients and ts filename.\nWidth, height, transmission width, transmission height, framerate, bitrate in kbps, stabilization and rotational stabilization are optional, default is 1920x1080@30 to 1280x720@30 2000 kbps.\n";
-	 return -1;
+    if (argc < 7) {
+         std::cout << "Arguments are v4l2 device, multiudpsink clients for stream 1, clients for stream 2, ts filename and port for JSON RPC listener.\nWidth, height, transmission width, transmission height, framerate, bitrate and bitrate1 in kbps, stabilization and rotational stabilization are optional, default is 1920x1080@30 to 1280x720@30 2000 kbps.\n";
+     return -1;
     }
     const char* device = argv[1];
-    const char* clients = argv[2];
-    const char* fout = argv[3];
-    const char* shmout = argv[4];
-    int bitrate = 2000*1000;
-    if (argc == 13){
-        width = std::stoi(argv[5]);
-      	height = std::stoi(argv[6]);
-        t_width = std::stoi(argv[7]);
-      	t_height = std::stoi(argv[8]);
-        fps = std::stoi(argv[9]);
-        bitrate = std::stoi(argv[10])*1000;
-	stab = (bool)std::stoi(argv[11]);
-	rot = (bool)std::stoi(argv[12]);
+    const char* clients0 = argv[2];
+    const char* clients1 = argv[3];
+    const char* fout = argv[4];
+    const char* shmout = argv[5];
+    int port = std::stoi(argv[6]);
+    if (argc == 15){
+    std::cout << "Setting extra params\n";
+        width = std::stoi(argv[7]);
+        height = std::stoi(argv[8]);
+        width_t0 = std::stoi(argv[9]);
+        height_t0 = std::stoi(argv[10]);
+        fps = std::stoi(argv[11]);
+        bitrate0 = std::stoi(argv[12])*1000;
+        bitrate1 = std::stoi(argv[13])*1000;
+        stab = std::stoi(argv[14]);
         crop_x = width*CROP_P;
         crop_y = height*CROP_P;    
     }
@@ -209,17 +272,18 @@ int main(int argc, char *argv[]) {
         if (std::filesystem::remove(filename)) {
             std::cout << "Pipe deleted successfully: " << filename << std::endl;
         } 
-	else {
-	    std::cerr << "Pipe in use?" << filename << std::endl;
+    else {
+        std::cerr << "Pipe in use?" << filename << std::endl;
         }
     } 
-
-
+    HttpServer httpserver(port);
+    JSONServer s(httpserver,JSONRPC_SERVER_V2);
+    s.StartListening();
     std::string cvpipeline = "v4l2src device=" + std::string(device) + " io-mode=4 ! "
                              "image/jpeg,width="+ std::to_string(width) +",height="+ std::to_string(height) +",framerate="+ std::to_string(fps) +"/1 ! "
                              "queue ! mppjpegdec format=16 ! video/x-raw,format=BGR ! tee name=t t. ! "
                              "queue ! appsink max-buffers=3 drop=true sync=false t. ! "
-			     "queue ! shmsink socket-path=" + std::string(shmout) + " wait-for-connection=false" ;
+                             "queue ! shmsink socket-path=" + std::string(shmout) + " wait-for-connection=false" ;
 
 
     cap.open(cvpipeline.c_str(),CAP_GSTREAMER);
@@ -229,7 +293,7 @@ int main(int argc, char *argv[]) {
     }
     
     // GStreamer pipeline elements
-    GstElement *pipeline, *videoconvert, *queue0, *glupload, *glcolorconvert0, *gltransform0, *gltransform1, *glcolorconvert1, *gldownload, *enccaps, *queue1, *x264enc, *rtph265pay, *udpsink, *tee, *queue_h265, *queue_h264, *tsmux, *filesink, *h264parse;
+    GstElement *pipeline, *videoconvert, *queue0, *glupload, *glcolorconvert0, *gltransform0, *gltransform1, *glcolorconvert1, *gldownload, *enccaps, *queue1, *x264enc, *rtph265pay0, *rtph265pay1,  *tee, *queue_h265_0, *queue_h264, *tsmux, *filesink, *h264parse,  *queue_h265_1;
     GstCaps *caps;
     // Create GStreamer pipeline
     pipeline = gst_pipeline_new("video-pipeline"); 
@@ -259,42 +323,64 @@ int main(int argc, char *argv[]) {
                             "right", crop_x,
                             NULL);
 
-    x265enc = gst_element_factory_make("mpph265enc", "x265-encoder");
-    g_object_set(x265enc, "bps", bitrate,
+    x265enc0 = gst_element_factory_make("mpph265enc", "x265-encoder0");
+    g_object_set(x265enc0, "bps", bitrate0,
                           "header-mode", 1, 
                           "max-pending", 1,
                           "rc-mode", 1,
                           "gop", fps,
-			  "width", t_width,
-			  "height", t_height,
-			  NULL);
+              "width", width_t0,
+              "height", height_t0,
+              NULL);
+
+    x265enc1 = gst_element_factory_make("mpph265enc", "x265-encoder1");
+    g_object_set(x265enc1, "bps", bitrate1,
+                          "header-mode", 1, 
+                          "max-pending", 1,
+                          "rc-mode", 1,
+                          "gop", fps,
+              "width", width_t1,
+              "height", height_t1,
+              NULL);
 
     x264enc = gst_element_factory_make("mpph264enc", "x264-encoder");
     g_object_set(x264enc, "bps", 10000000,
-		          "bps-min", 5000000,
-			  "bps-max", 15000000,
+                  "bps-min", 5000000,
+              "bps-max", 15000000,
                           "header-mode", 1, 
-			  "max-pending", 16,
-			  "gop", fps*10,
-			  "rc-mode", 0,
-			  NULL);
+              "max-pending", 16,
+	      "max-reenc", 3,
+              "gop", fps*10,
+              "rc-mode", 0,
+	      "width", width,
+	      "height",height,
+              NULL);
     tsmux = gst_element_factory_make("mpegtsmux", "tsmux");
 
-    rtph265pay = gst_element_factory_make("rtph265pay", "h265-payloader");
-    g_object_set(rtph265pay, "config-interval", -1,
-		                         "aggregate-mode", 1,
-			                       "mtu", 896,
-			                        NULL);
+    rtph265pay0 = gst_element_factory_make("rtph265pay", "h265-payloader0");
+    g_object_set(rtph265pay0, "config-interval", -1,
+                                 "aggregate-mode", 1,
+                                   "mtu", 1024,
+                                    NULL);
+    rtph265pay1 = gst_element_factory_make("rtph265pay", "h265-payloader1");
+    g_object_set(rtph265pay1, "config-interval", -1,
+                                 "aggregate-mode", 1,
+                                   "mtu", 1400,
+                                    NULL);
     filesink = gst_element_factory_make("filesink", "file-sink");
     g_object_set(G_OBJECT(filesink), "location", fout, "sync", FALSE, "async", FALSE, NULL);
 
-    udpsink = gst_element_factory_make("multiudpsink", "udp-sink");
-    g_object_set(G_OBJECT(udpsink), "clients", clients, "sync", FALSE, "async", FALSE, NULL);
+    udpsink0 = gst_element_factory_make("multiudpsink", "udp-sink_0");
+    g_object_set(G_OBJECT(udpsink0), "clients", clients0, "sync", FALSE, "async", FALSE, NULL);
+
+    udpsink1 = gst_element_factory_make("multiudpsink", "udp-sink_1");
+    g_object_set(G_OBJECT(udpsink1), "clients", clients1, "sync", FALSE, "async", FALSE, NULL);
 
     // Configure tee elements and queues
     tee = gst_element_factory_make("tee", "tee");
     queue_h264 = gst_element_factory_make("queue", "queue_h264");
-    queue_h265 = gst_element_factory_make("queue", "queue_h265");
+    queue_h265_0 = gst_element_factory_make("queue", "queue_h265_0");
+    queue_h265_1 = gst_element_factory_make("queue", "queue_h265_1");
 
     // Configure the appsrc element
     g_object_set(G_OBJECT(appsrc), "caps",
@@ -312,15 +398,18 @@ int main(int argc, char *argv[]) {
 
     // Build the pipeline
     gst_bin_add_many(GST_BIN(pipeline), appsrc, queue0, videocrop, tee, 
-		                        queue_h265, x265enc, rtph265pay, udpsink, 
-					queue_h264, x264enc, tsmux, filesink,
-					NULL);
+                     queue_h265_0, x265enc0, rtph265pay0, udpsink0, 
+                     queue_h265_1, x265enc1, rtph265pay1, udpsink1,
+                     queue_h264, x264enc, tsmux, filesink,
+                    NULL);
     if (!gst_element_link_many(appsrc, queue0, videocrop, tee, NULL) || 
-	!gst_element_link_many(queue_h265, x265enc, rtph265pay, udpsink, NULL) ||    
-	!gst_element_link_many(queue_h264, x264enc, tsmux, filesink, NULL) ||    
-        !gst_element_link_many(tee, queue_h265, NULL) || 
+        !gst_element_link_many(queue_h265_0, x265enc0, rtph265pay0, udpsink0, NULL) ||    
+        !gst_element_link_many(queue_h265_1, x265enc1, rtph265pay1, udpsink1, NULL) ||    
+        !gst_element_link_many(queue_h264, x264enc, tsmux, filesink, NULL) ||    
+        !gst_element_link_many(tee, queue_h265_0, NULL) || 
+        !gst_element_link_many(tee, queue_h265_1, NULL) || 
         !gst_element_link_many(tee, queue_h264, NULL)
-	) {
+    ) {
         g_printerr("GStreamer elements could not be linked.\n");
         gst_object_unref(pipeline);
         return -1;
@@ -341,5 +430,6 @@ int main(int argc, char *argv[]) {
     gst_object_unref(pipeline);
     g_main_loop_unref(main_loop);
     cap.release();
+    s.StopListening();
     return 0;
 }

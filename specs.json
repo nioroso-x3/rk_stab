@@ -1,0 +1,12 @@
+[
+  {
+    "name": "setParam",
+    "params": {
+      "args": {}
+    }
+  },
+  {
+    "name": "getParam",
+    "returns" : {}
+  }
+]

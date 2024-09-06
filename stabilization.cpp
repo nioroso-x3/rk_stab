@@ -48,7 +48,7 @@ stabilizer::stabilize(cv::Mat &buf, float* rx, float* ry, float* ra){
   cv::Mat tmp = currGray(roi).clone();
   currGray = tmp.clone();
    
-  if (prevFrame.empty()){
+  if (prevFrame.empty() || prevFrame.size() != currFrame.size()){
     prevOrig = orig.clone();
     prevFrame = currFrame.clone();
     prevGray = currGray.clone();
@@ -155,3 +155,17 @@ cv::Mat stabilizer::getStabFrame(){
   cv::warpAffine(fS, f_stabilized, T, s);
   return f_stabilized;
 }
+
+void stabilizer::setZoomFactor(double f){
+  zoomFactor = f;
+}
+void stabilizer::setProcessVar(double f){
+  processVar = f;
+}
+void stabilizer::setMeasVar(double f){
+  measVar = f;
+}
+void stabilizer::setRoiDiv(double f){
+  roiDiv = f;
+}
+

@@ -34,6 +34,10 @@ class stabilizer
     cv::Mat getFrame(void);
     cv::Mat getPrevFrame(void);
     cv::Mat getStabFrame(void);
+    void setZoomFactor(double f);
+    void setProcessVar(double f);
+    void setMeasVar(double f);
+    void setRoiDiv(double f);
 };
 
 
