@@ -5,7 +5,7 @@
 #include <csignal>
 #include <filesystem>
 #include <chrono>
-#define CL_HPP_TARGET_OPENCL_VERSION 300
+#define CL_HPP_TARGET_OPENCL_VERSION 210
 #include <CL/opencl.hpp>
 #include <gst/gst.h>
 //#include <gst/gl/gl.h>
@@ -22,14 +22,10 @@ using namespace jsonrpc;
 //GstElement *gltransformation1;
 GstElement *appsrc;
 GstElement *videocrop;
-GstElement *x265enc0, *x265enc1;
-GstElement *rtph265pay0, *rtph265pay1;
-GstElement *udpsink0, *udpsink1;
-GstElement *selector0, *selector1;
-GstPad *sel0_s0;
-GstPad *sel0_s1;
-GstPad *sel1_s0;
-GstPad *sel1_s1;
+GstElement *x265enc0;
+GstElement *x265enc1;
+GstElement *udpsink0;
+GstElement *udpsink1;
 stabilizer st;
 VideoCapture cap;
 std::thread frames;
@@ -45,10 +41,6 @@ int crop_y = height*CROP_P;
 int bitrate0 = 2000*1000;
 int bitrate1 = bitrate0/3;
 int stab = 3;
-int s0_cur = 0;
-int s1_cur = 1;
-int mtu0 = 1024;
-int mtu1 = 1024;
 std::string clients0;
 std::string clients1;
 
@@ -82,92 +74,70 @@ void JSONServer::setParam(const Json::Value &args){
       }
       i++;
     }
-    if (args.isMember("stream0_bitrate") && args["stream0_bitrate"].isInt()){
-      bitrate0 = args["stream0_bitrate"].asInt()*1000;
+    if (args.isMember("bitrate0") && args["bitrate0"].isInt()){
+      bitrate0 = args["bitrate0"].asInt()*1000;
       g_object_set(x265enc0, "bps", bitrate0, NULL);
 
     }
-    if (args.isMember("stream1_bitrate") && args["stream1_mtu"].isInt()){ 
-      bitrate1 = args["stream1_mtu"].asInt()*1000;
+    if (args.isMember("bitrate1") && args["bitrate1"].isInt()){ 
+      bitrate1 = args["bitrate1"].asInt()*1000;
       g_object_set(x265enc1, "bps", bitrate1, NULL);
     }
-    if (args.isMember("stream0_mtu") && args["stream0_mtu"].isInt()){
-      mtu0 = args["stream0_mtu"].asInt();
-      g_object_set(rtph265pay0, "mtu", mtu0, NULL);
-
-    }
-    if (args.isMember("stream1_mtu") && args["stream1_mtu"].isInt()){ 
-      mtu1 = args["stream1_mtu"].asInt();
-      g_object_set(rtph265pay1, "mtu", mtu1, NULL);
-    }
-
-
     if (args.isMember("stab") && args["stab"].isInt()) stab = args["stab"].asInt();
     if (args.isMember("clients0") && args["clients0"].isString()){
-      clients0 = args["clients0"].asString();
-      g_object_set(G_OBJECT(udpsink0), "clients", clients0.c_str(), NULL);
+       clients0 = args["clients0"].asString();
+       g_object_set(G_OBJECT(udpsink0), "clients", clients0.c_str(), NULL);
 
     }
     if (args.isMember("clients1") && args["clients1"].isString()){
-      clients1 = args["clients1"].asString();
-      g_object_set(G_OBJECT(udpsink1), "clients", clients1.c_str(), NULL);
+       clients0 = args["clients1"].asString();
+       g_object_set(G_OBJECT(udpsink1), "clients", clients1.c_str(), NULL);
     }
-    if (args.isMember("output0_stream") && args["output0_stream"].isInt()){
-      if(args["output0_stream"].asInt() == 0){ 
-        g_object_set(selector0, "active-pad", sel0_s0, NULL);
-        s0_cur = 0;
-      }
-      if(args["output0_stream"].asInt() == 1){
-        g_object_set(selector0, "active-pad", sel0_s1, NULL); 
-	s0_cur = 1;
-      }
-    }
-    if (args.isMember("output1_stream") && args["output1_stream"].isInt()){
-      if(args["output1_stream"].asInt() == 0){ 
-        g_object_set(selector1, "active-pad", sel1_s0, NULL);
-        s1_cur = 0;
-      }
-      if(args["output1_stream"].asInt() == 1){
-        g_object_set(selector1, "active-pad", sel1_s1, NULL); 
-	s1_cur = 1;
-      }
-    }
-
 }
 
 Json::Value JSONServer::getParam(){
   Json::Value result;
-  result["stream0_bitrate"] = bitrate0/1000;
-  result["stream1_bitrate"] = bitrate1/1000;
-  result["stream0_mtu"] = mtu0;
-  result["stream1_mtu"] = mtu1;
+  result["bitrate0"] = bitrate0/1000;
+  result["bitrate1"] = bitrate1/1000;
   result["stab"] = stab;
   result["clients0"] = clients0;
   result["clients1"] = clients1;
-  result["output0_stream"] = s0_cur;
-  result["output1_stream"] = s1_cur;
   return result;
 }
 
 
 // OpenCL kernel for rotating an image
 const char *rotateKernelSource = R"(
-__kernel void rotate_image(__global uchar4* input, __global uchar4* output, int width, int height, float cosTheta, float sinTheta) {
-    int x = get_global_id(0);
-    int y = get_global_id(1);
-    int xc = width / 2;
-    int yc = height / 2;
+__kernel void rotate_image(
+    image2d_t srcImage,    // Input image
+    image2d_t dstImage,   // Output image
+    const float center_x,                   // center x
+    const float center_y,                   // center y
+    const float cosTheta,                 // Rotation angle in radians
+    const float sinTheta,                 // Rotation angle in radians
+) {
+    // Get the global ID (x, y) for the current thread
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
 
-    int nx = (int)(cosTheta * (x - xc) - sinTheta * (y - yc) + xc);
-    int ny = (int)(sinTheta * (x - xc) + cosTheta * (y - yc) + yc);
+    // Compute the relative position of the pixel to the center
+    const float2 relPos = (float2)((float)x - center_x, (float)y - center_y);
 
-    if(nx >= 0 && nx < width && ny >= 0 && ny < height) {
-        output[y * width + x] = input[ny * width + nx];
-    } else {
-        output[y * width + x] = (uchar4)(0, 0, 0, 0); 
+    // Apply the rotation to get the new position
+    const float2 newPos = (float2)(
+        cosTheta * relPos.x - sinTheta * relPos.y + center.x,
+        sinTheta * relPos.x + cosTheta * relPos.y + center.y
+    );
+    if (newPos.x >= 0 && newPos.x < (width*2) && newPos.y >= 0 && newPos.y < (height*2) {
+      // Read from the input image using bilinear interpolation
+      float4 pixel = read_imagef(srcImage, CLK_NORMALIZED_COORDS_FALSE | CLK_FILTER_LINEAR, newPos);
+      // Write the resulting pixel to the output image
+      write_imagef(dstImage, (int2)(x, y), pixel);
     }
 }
+
 )";
+
 
 
 // Callback to push data to appsrc
@@ -197,7 +167,7 @@ void process_frame() {
     cl::NDRange globalSize(width, height);
   
     std::cout << "Started reading frames\n";
-    unsigned long int frame_count = 0;
+    uint64_t frame_count = 0;
     //some timers for benchmarking
     auto t1 = std::chrono::high_resolution_clock::now();
     auto t2 = t1;
@@ -205,13 +175,15 @@ void process_frame() {
     auto t4 = t1;
 
     // Allocate OpenCL input and output buffers
-    cl::Buffer inputBuffer(context, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, frameSize*sizeof(unsigned char));
-    cl::Buffer outputBuffer(context, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, frameSize*sizeof(unsigned char));
+    cl::Image2D inputBuffer(context, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, cl::ImageFormat(CL_RGBA, CL_UNORM_INT8), width, height);
+    cl::Image2D outputBuffer(context, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, cl::ImageFormat(CL_RGBA, CL_UNORM_INT8), width, height);
     // Set fixed kernel arguments
     rotateKernel.setArg(0, inputBuffer);
     rotateKernel.setArg(1, outputBuffer);
-    rotateKernel.setArg(2, width);
-    rotateKernel.setArg(3, height);
+    rotateKernel.setArg(2, width/2);
+    rotateKernel.setArg(3, height/2);
+    cl::array<uint64_t,3> origin = {0, 0, 0};
+    cl::array<uint64_t,3> region = {(uint32_t)width, (uint32_t)height, 1};
     while(true){
         static GstClockTime timestamp = 0;    
         cap >> frame;
@@ -226,10 +198,10 @@ void process_frame() {
             if (a < 0.001f && a > -0.001f) a = 0.0f;
             gfloat gx = x;
             gfloat gy = y;
-            //clamp rotation angle to 2 degrees
-            if (a > 0.035) a = 0.035;
-            if (a < -0.035) a = -0.035;
-           
+            //clamp rotation angle to 4 degrees
+            if (a > 0.07) a = 0.07;
+            if (a < -0.07) a = -0.07;
+            a= 0.0f; 
             prevFrame = st.getPrevFrame();
             if (prevFrame.empty()) continue;
             image = &prevFrame;
@@ -240,9 +212,9 @@ void process_frame() {
                 rotateKernel.setArg(5, std::sin(a));
 
                // Run the kernel
-                queue.enqueueWriteBuffer(inputBuffer, CL_TRUE, 0, frameSize*sizeof(unsigned char), (unsigned char*)prevFrame.datastart); 
+                queue.enqueueWriteImage(inputBuffer, CL_TRUE, origin, region, 0, 0, (unsigned char*)prevFrame.datastart); 
                 queue.enqueueNDRangeKernel(rotateKernel, cl::NullRange, globalSize, cl::NullRange);
-                queue.enqueueReadBuffer(outputBuffer, CL_TRUE, 0, frameSize*sizeof(unsigned char), (unsigned char*)output.datastart);
+                queue.enqueueReadImage(outputBuffer, CL_TRUE, origin, region, 0, 0, (unsigned char*)output.datastart);
                 cvtColor(output,prevFrame,COLOR_BGRA2BGR);        
                 t4 = std::chrono::high_resolution_clock::now();
             }
@@ -291,7 +263,7 @@ void process_frame() {
         t2 = std::chrono::high_resolution_clock::now();
         int delay = std::chrono::duration_cast<std::chrono::milliseconds>(t2-t1).count();
         int rot = std::chrono::duration_cast<std::chrono::milliseconds>(t4-t3).count();
-        //if (frame_count % 120 == 0) std::cout << "loop ms: " << delay-rot  << "\n" << "rot ms: " << rot << "\n";
+        if (frame_count % 120 == 0) std::cout << "loop ms: " << delay-rot  << "\n" << "rot ms: " << rot << "\n";
         frame_count++;
     }
 }
@@ -350,19 +322,28 @@ int main(int argc, char *argv[]) {
     }
     
     // GStreamer pipeline elements
-    GstElement *pipeline, *videoconvert, *queue0, *queue1, *x264enc,  *tee, *queue_h265_0, *queue_h264, *tsmux, *filesink, *h264parse,  *queue_h265_1;
-    GstElement *tee_hr, *tee_lr;
-    GstElement *queue_hr_0, *queue_hr_1, *queue_lr_0, *queue_lr_1;
-
+    GstElement *pipeline, *videoconvert, *queue0, *glupload, *glcolorconvert0, *gltransform0, *gltransform1, *glcolorconvert1, *gldownload, *enccaps, *queue1, *x264enc, *rtph265pay0, *rtph265pay1,  *tee, *queue_h265_0, *queue_h264, *tsmux, *filesink, *h264parse,  *queue_h265_1;
     GstCaps *caps;
     // Create GStreamer pipeline
     pipeline = gst_pipeline_new("video-pipeline"); 
     queue0 = gst_element_factory_make("queue", "queue0");
     queue1 = gst_element_factory_make("queue", "queue1");
     appsrc = gst_element_factory_make("appsrc", "source");
-    selector0 = gst_element_factory_make("input-selector", "selector0");
-    selector1 = gst_element_factory_make("input-selector", "selector1");
-    
+    videoconvert = gst_element_factory_make("videoconvert", "videoconvert");
+    /*
+    glcolorconvert0 = gst_element_factory_make("glcolorconvert", "glcolorconvert0");
+    glupload = gst_element_factory_make("glupload", "glupload");
+    gltransformation0 = gst_element_factory_make("gltransformation", "gltransformation0");
+    gltransformation1 = gst_element_factory_make("gltransformation", "gltransformation1");
+    glcolorconvert1 = gst_element_factory_make("glcolorconvert", "glcolorconvert1");
+    gldownload = gst_element_factory_make("gldownload", "gldownload");
+    */
+    enccaps = gst_element_factory_make("capsfilter", "enccaps");
+    caps = gst_caps_new_simple("video/x-raw",
+                               "format", G_TYPE_STRING, "I420",
+                                NULL);
+    g_object_set(enccaps, "caps", caps, NULL);
+    gst_caps_unref(caps);
     videocrop = gst_element_factory_make("videocrop", "videocrop");
     g_object_set(videocrop, "top", crop_y,
                             "bottom", crop_y,
@@ -407,12 +388,12 @@ int main(int argc, char *argv[]) {
     rtph265pay0 = gst_element_factory_make("rtph265pay", "h265-payloader0");
     g_object_set(rtph265pay0, "config-interval", -1,
                               "aggregate-mode", 1,
-                              "mtu", mtu0,
+                              "mtu", 768,
                               NULL);
     rtph265pay1 = gst_element_factory_make("rtph265pay", "h265-payloader1");
     g_object_set(rtph265pay1, "config-interval", -1,
                               "aggregate-mode", 1,
-                              "mtu", mtu1,
+                              "mtu", 1400,
                               NULL);
     filesink = gst_element_factory_make("filesink", "file-sink");
     g_object_set(G_OBJECT(filesink), "location", fout, "sync", FALSE, "async", FALSE, NULL);
@@ -425,17 +406,10 @@ int main(int argc, char *argv[]) {
 
     // Configure tee elements and queues
     tee = gst_element_factory_make("tee", "tee");
-    tee_hr = gst_element_factory_make("tee", "tee_hr");
-    tee_lr = gst_element_factory_make("tee", "tee_lr");
     queue_h264 = gst_element_factory_make("queue", "queue_h264");
     queue_h265_0 = gst_element_factory_make("queue", "queue_h265_0");
     queue_h265_1 = gst_element_factory_make("queue", "queue_h265_1");
-   
-    queue_hr_0 = gst_element_factory_make("queue", "queue_hr_0");
-    queue_hr_1 = gst_element_factory_make("queue", "queue_hr_1");
-    queue_lr_0 = gst_element_factory_make("queue", "queue_lr_0");
-    queue_lr_1 = gst_element_factory_make("queue", "queue_lr_1");
- 
+
     // Configure the appsrc element
     g_object_set(G_OBJECT(appsrc), "caps",
                  gst_caps_new_simple("video/x-raw",
@@ -452,43 +426,23 @@ int main(int argc, char *argv[]) {
 
     // Build the pipeline
     gst_bin_add_many(GST_BIN(pipeline), appsrc, queue0, videocrop, tee, 
-                                        queue_h265_0, x265enc0, rtph265pay0, tee_hr, 
-                                        queue_h265_1, x265enc1, rtph265pay1, tee_lr,
+                                        queue_h265_0, x265enc0, rtph265pay0, udpsink0, 
+                                        queue_h265_1, x265enc1, rtph265pay1, udpsink1,
                                         queue_h264, x264enc, tsmux, filesink,
-					queue_hr_0, selector0, udpsink0,
-					queue_lr_0, selector0,
-					queue_hr_1, selector1, udpsink1,
-					queue_lr_1, selector1,
-                                        NULL);
+                    NULL);
     if (!gst_element_link_many(appsrc, queue0, videocrop, tee, NULL) || 
-        !gst_element_link_many(queue_h265_0, x265enc0, rtph265pay0, tee_hr, NULL) ||    
-        !gst_element_link_many(queue_h265_1, x265enc1, rtph265pay1, tee_lr, NULL) ||    
+        !gst_element_link_many(queue_h265_0, x265enc0, rtph265pay0, udpsink0, NULL) ||    
+        !gst_element_link_many(queue_h265_1, x265enc1, rtph265pay1, udpsink1, NULL) ||    
         !gst_element_link_many(queue_h264, x264enc, tsmux, filesink, NULL) ||    
-        !gst_element_link_many(queue_hr_0, selector0, udpsink0, NULL) ||    
-        !gst_element_link_many(queue_lr_0, selector0, NULL) ||    
-        !gst_element_link_many(queue_hr_1, selector1, udpsink1, NULL) ||    
-        !gst_element_link_many(queue_lr_1, selector1, NULL) ||    
-	!gst_element_link_many(tee, queue_h265_0, NULL) || 
+        !gst_element_link_many(tee, queue_h265_0, NULL) || 
         !gst_element_link_many(tee, queue_h265_1, NULL) || 
-        !gst_element_link_many(tee, queue_h264, NULL)  ||
-	!gst_element_link_many(tee_hr, queue_hr_0, NULL) ||
-	!gst_element_link_many(tee_hr, queue_hr_1, NULL) ||
-	!gst_element_link_many(tee_lr, queue_lr_0, NULL) ||
-	!gst_element_link_many(tee_lr, queue_lr_1, NULL)
-
+        !gst_element_link_many(tee, queue_h264, NULL)
        ) 
     {
         g_printerr("GStreamer elements could not be linked.\n");
         gst_object_unref(pipeline);
         return -1;
     }
-    sel0_s0 = gst_element_get_static_pad(selector0, "sink_0");
-    sel0_s1 = gst_element_get_static_pad(selector0, "sink_1");
-    sel1_s0 = gst_element_get_static_pad(selector1, "sink_0");
-    sel1_s1 = gst_element_get_static_pad(selector1, "sink_1");
-
-    g_object_set(selector0, "active-pad", sel0_s0, NULL);
-    g_object_set(selector1, "active-pad", sel1_s1, NULL);
 
 
     // Set the pipeline to the playing state
