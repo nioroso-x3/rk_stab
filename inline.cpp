@@ -87,8 +87,8 @@ void JSONServer::setParam(const Json::Value &args){
       g_object_set(x265enc0, "bps", bitrate0, NULL);
 
     }
-    if (args.isMember("stream1_bitrate") && args["stream1_mtu"].isInt()){ 
-      bitrate1 = args["stream1_mtu"].asInt()*1000;
+    if (args.isMember("stream1_bitrate") && args["stream1_bitrate"].isInt()){ 
+      bitrate1 = args["stream1_bitrate"].asInt()*1000;
       g_object_set(x265enc1, "bps", bitrate1, NULL);
     }
     if (args.isMember("stream0_mtu") && args["stream0_mtu"].isInt()){
@@ -103,15 +103,18 @@ void JSONServer::setParam(const Json::Value &args){
 
 
     if (args.isMember("stab") && args["stab"].isInt()) stab = args["stab"].asInt();
+
     if (args.isMember("clients0") && args["clients0"].isString()){
       clients0 = args["clients0"].asString();
       g_object_set(G_OBJECT(udpsink0), "clients", clients0.c_str(), NULL);
 
     }
+
     if (args.isMember("clients1") && args["clients1"].isString()){
       clients1 = args["clients1"].asString();
       g_object_set(G_OBJECT(udpsink1), "clients", clients1.c_str(), NULL);
     }
+
     if (args.isMember("output0_stream") && args["output0_stream"].isInt()){
       if(args["output0_stream"].asInt() == 0){ 
         g_object_set(selector0, "active-pad", sel0_s0, NULL);
@@ -340,6 +343,7 @@ int main(int argc, char *argv[]) {
                              "image/jpeg,width="+ std::to_string(width) +",height="+ std::to_string(height) +",framerate="+ std::to_string(fps) +"/1 ! "
                              "queue ! mppjpegdec format=16 ! video/x-raw,format=BGR ! tee name=t t. ! "
                              "queue ! appsink max-buffers=2 drop=true sync=false t. ! "
+                             "queue ! mpph264enc bps=20000000 gop="+std::to_string(fps*10)+" rc-mode=1 ! h264parse config-interval=-1 ! mpegtsmux ! filesink location="+std::string(fout)+" t. ! "
                              "queue ! shmsink socket-path=" + std::string(shmout) + " wait-for-connection=false" ;
 
 
@@ -454,7 +458,7 @@ int main(int argc, char *argv[]) {
     gst_bin_add_many(GST_BIN(pipeline), appsrc, queue0, videocrop, tee, 
                                         queue_h265_0, x265enc0, rtph265pay0, tee_hr, 
                                         queue_h265_1, x265enc1, rtph265pay1, tee_lr,
-                                        queue_h264, x264enc, tsmux, filesink,
+                                        //queue_h264, x264enc, tsmux, filesink,
 					queue_hr_0, selector0, udpsink0,
 					queue_lr_0, selector0,
 					queue_hr_1, selector1, udpsink1,
@@ -463,14 +467,14 @@ int main(int argc, char *argv[]) {
     if (!gst_element_link_many(appsrc, queue0, videocrop, tee, NULL) || 
         !gst_element_link_many(queue_h265_0, x265enc0, rtph265pay0, tee_hr, NULL) ||    
         !gst_element_link_many(queue_h265_1, x265enc1, rtph265pay1, tee_lr, NULL) ||    
-        !gst_element_link_many(queue_h264, x264enc, tsmux, filesink, NULL) ||    
+        //!gst_element_link_many(queue_h264, x264enc, tsmux, filesink, NULL) ||    
         !gst_element_link_many(queue_hr_0, selector0, udpsink0, NULL) ||    
         !gst_element_link_many(queue_lr_0, selector0, NULL) ||    
         !gst_element_link_many(queue_hr_1, selector1, udpsink1, NULL) ||    
         !gst_element_link_many(queue_lr_1, selector1, NULL) ||    
 	!gst_element_link_many(tee, queue_h265_0, NULL) || 
         !gst_element_link_many(tee, queue_h265_1, NULL) || 
-        !gst_element_link_many(tee, queue_h264, NULL)  ||
+        //!gst_element_link_many(tee, queue_h264, NULL)  ||
 	!gst_element_link_many(tee_hr, queue_hr_0, NULL) ||
 	!gst_element_link_many(tee_hr, queue_hr_1, NULL) ||
 	!gst_element_link_many(tee_lr, queue_lr_0, NULL) ||
